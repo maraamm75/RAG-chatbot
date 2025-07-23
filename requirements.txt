@@ -1,0 +1,13 @@
+streamlit
+PyPDF2
+pinecone
+google-generativeai
+tqdm
+python-dotenv
+PyMuPDF
+gradio
+openai
+cohere
+mistral
+transformers
+tokenizer
