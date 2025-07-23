@@ -11,3 +11,4 @@ cohere
 mistral
 transformers
 tokenizer
+openai anthropic
