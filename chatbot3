@@ -1,0 +1,303 @@
+import os
+import re
+import io
+import numpy as np
+import pickle
+from typing import List, Dict, Tuple
+import PyPDF2
+import faiss
+from sentence_transformers import SentenceTransformer
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, pipeline
+import warnings
+warnings.filterwarnings("ignore")
+
+class LocalEmbedder:
+    """Local embedding model using SentenceTransformers"""
+    
+    def __init__(self, model_name="all-MiniLM-L6-v2"):
+        """Initialize the local embedding model"""
+        self.model_name = model_name
+        print(f"🔄 Loading embedding model: {model_name}")
+        try:
+            self.model = SentenceTransformer(model_name)
+            self.embedding_dim = self.model.get_sentence_embedding_dimension()
+            print(f"✅ Embedding model loaded successfully (dim: {self.embedding_dim})")
+        except Exception as e:
+            print(f"❌ Failed to load embedding model: {e}")
+            raise
+    
+    def embed_documents(self, texts: List[str]) -> np.ndarray:
+        """Embed a list of documents"""
+        try:
+            embeddings = self.model.encode(texts, show_progress_bar=True)
+            return embeddings
+        except Exception as e:
+            print(f"❌ Error embedding documents: {e}")
+            return np.array([])
+    
+    def embed_query(self, query: str) -> np.ndarray:
+        """Embed a single query"""
+        try:
+            embedding = self.model.encode([query])
+            return embedding[0]
+        except Exception as e:
+            print(f"❌ Error embedding query: {e}")
+            return np.array([])
+
+class LocalVectorStore:
+    """Local vector database using FAISS"""
+    
+    def __init__(self):
+        """Initialize the local vector store"""
+        self.index = None
+        self.documents = []
+        self.metadatas = []
+        self.embedding_dim = None
+        print("✅ Local vector store initialized")
+    
+    def add_documents(self, texts: List[str], embeddings: np.ndarray, metadatas: List[Dict]):
+        """Add documents to the vector store"""
+        try:
+            if self.index is None:
+                # Initialize FAISS index
+                self.embedding_dim = embeddings.shape[1]
+                self.index = faiss.IndexFlatL2(self.embedding_dim)
+                print(f"📦 Created FAISS index with dimension {self.embedding_dim}")
+            
+            # Add vectors to index
+            self.index.add(embeddings.astype('float32'))
+            
+            # Store documents and metadata
+            self.documents.extend(texts)
+            self.metadatas.extend(metadatas)
+            
+            print(f"✅ Added {len(texts)} documents to vector store")
+            
+        except Exception as e:
+            print(f"❌ Error adding documents to vector store: {e}")
+            raise
+    
+    def search(self, query_embedding: np.ndarray, k: int = 5) -> List[Dict]:
+        """Search for similar documents"""
+        try:
+            if self.index is None or len(self.documents) == 0:
+                return []
+            
+            # Search in FAISS index
+            query_vector = query_embedding.reshape(1, -1).astype('float32')
+            distances, indices = self.index.search(query_vector, min(k, len(self.documents)))
+            
+            results = []
+            for distance, idx in zip(distances[0], indices[0]):
+                if idx < len(self.documents):
+                    result = self.metadatas[idx].copy()
+                    result['text'] = self.documents[idx]
+                    result['score'] = 1.0 / (1.0 + distance)  # Convert distance to similarity score
+                    results.append(result)
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ Error searching vector store: {e}")
+            return []
+    
+    def get_count(self) -> int:
+        """Get the number of documents in the store"""
+        return len(self.documents)
+
+class LocalLLM:
+    """Local language model using transformers"""
+    
+    def __init__(self, model_name="gpt2"):
+        """Initialize the local language model"""
+        self.model_name = model_name
+        print(f"🔄 Loading language model: {model_name}")
+        try:
+            # Initialize the text generation pipeline
+            self.generator = pipeline(
+                "text-generation",
+                model=model_name,
+                tokenizer=model_name,
+                device=-1,  # Use CPU
+                return_full_text=False,
+                max_new_tokens=200,
+                do_sample=True,
+                temperature=0.7,
+                pad_token_id=50256  # GPT-2 EOS token
+            )
+            print("✅ Language model loaded successfully")
+        except Exception as e:
+            print(f"❌ Failed to load language model: {e}")
+            raise
+    
+    def generate(self, prompt: str, max_length: int = 200) -> str:
+        """Generate text based on prompt"""
+        try:
+            # Generate response
+            responses = self.generator(
+                prompt,
+                max_new_tokens=max_length,
+                num_return_sequences=1,
+                do_sample=True,
+                temperature=0.7
+            )
+            
+            generated_text = responses[0]['generated_text'].strip()
+            
+            # Clean up the response
+            sentences = generated_text.split('. ')
+            clean_sentences = []
+            
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if sentence and len(sentence) > 10:
+                    clean_sentences.append(sentence)
+                    if len(clean_sentences) >= 3:  # Limit to 3 sentences for coherency
+                        break
+            
+            result = '. '.join(clean_sentences)
+            if result and not result.endswith('.'):
+                result += '.'
+                
+            return result if result else "I apologize, but I couldn't generate a proper response."
+            
+        except Exception as e:
+            print(f"❌ Error generating text: {e}")
+            return f"Error generating response: {str(e)}"
+
+def clean_text(text: str) -> str:
+    """Clean extracted text from PDF"""
+    if not text:
+        return ""
+    
+    # Remove excessive whitespace and newlines
+    text = re.sub(r'\n+', '\n', text)
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Remove special characters but keep basic punctuation
+    text = re.sub(r'[^\w\s\.\,\!\?\;\:\-\(\)\[\]\"\']+', '', text)
+    
+    # Split into lines and filter out very short lines
+    lines = text.split('\n')
+    clean_lines = [line.strip() for line in lines if len(line.strip()) > 10]
+    
+    return '\n'.join(clean_lines)
+
+def extract_text_from_pdf(file_bytes: bytes, filename: str) -> List[Dict]:
+    """Extract text from PDF bytes"""
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+        pages = []
+        
+        for i, page in enumerate(reader.pages):
+            print(f"📄 Extracting page {i+1} of {len(reader.pages)} from {filename}")
+            text = page.extract_text()
+            cleaned = clean_text(text)
+            
+            if cleaned:  # Only add non-empty pages
+                pages.append({
+                    "page_number": i + 1,
+                    "text": cleaned,
+                    "filename": filename
+                })
+        
+        print(f"📄 Extracted {len(pages)} pages with content from {filename}")
+        return pages
+        
+    except Exception as e:
+        print(f"❌ PDF extraction failed for {filename}: {e}")
+        return []
+
+def chunk_pages(pages: List[Dict], chunk_size: int = 800, overlap: int = 100) -> List[Dict]:
+    """Split pages into chunks"""
+    chunks = []
+    
+    for page in pages:
+        text = page.get('text', '').strip()
+        page_number = page.get('page_number', -1)
+        filename = page.get('filename', 'unknown')
+
+        if not text:
+            print(f"⚠️ Skipping empty page {page_number} from {filename}")
+            continue
+
+        # Split text into chunks
+        start = 0
+        while start < len(text):
+            end = min(start + chunk_size, len(text))
+            chunk_text = text[start:end]
+
+            # Make sure we don't cut words in half
+            if end < len(text):
+                last_space = chunk_text.rfind(' ')
+                if last_space > len(chunk_text) * 0.8:  # If we find a space in the last 20%
+                    end = start + last_space
+                    chunk_text = text[start:end]
+
+            if len(chunk_text.strip()) > 50:  # Only add meaningful chunks
+                chunks.append({
+                    'page_number': page_number,
+                    'text': chunk_text.strip(),
+                    'filename': filename
+                })
+
+            start = end - overlap if end < len(text) else end
+
+    print(f"✅ Created {len(chunks)} chunks from {len(pages)} pages")
+    return chunks
+
+def retrieve_relevant_chunks(question: str, embedder: LocalEmbedder, vector_store: LocalVectorStore, top_k: int = 5) -> List[Dict]:
+    """Retrieve relevant chunks using local vector search"""
+    try:
+        # Get query embedding
+        query_embedding = embedder.embed_query(question)
+        if query_embedding.size == 0:
+            return []
+        
+        # Search for similar chunks
+        results = vector_store.search(query_embedding, k=top_k)
+        
+        print(f"🔍 Retrieved {len(results)} relevant chunks")
+        return results
+        
+    except Exception as e:
+        print(f"❌ Error retrieving chunks: {e}")
+        return []
+
+def generate_answer_from_context(question: str, context_chunks: List[Dict], llm: LocalLLM) -> str:
+    """Generate answer using local LLM based on context"""
+    if not context_chunks:
+        return "⚠️ No relevant context found to answer your question."
+    
+    try:
+        # Prepare context
+        context_texts = []
+        for chunk in context_chunks[:3]:  # Use top 3 chunks to avoid token limit
+            filename = chunk.get('filename', 'unknown')
+            page_num = chunk.get('page_number', 'unknown')
+            text = chunk.get('text', '')[:300]  # Limit text length
+            context_texts.append(f"From {filename} (Page {page_num}): {text}")
+        
+        context = "\n\n".join(context_texts)
+        
+        # Create prompt
+        prompt = f"""Based on the following context, answer the question concisely and accurately.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+        
+        # Generate answer
+        answer = llm.generate(prompt, max_length=150)
+        
+        # Add source information
+        unique_sources = list(set(chunk.get('filename', 'unknown') for chunk in context_chunks))
+        source_info = f"\n\n📚 Sources: {', '.join(unique_sources)}"
+        
+        return answer + source_info
+        
+    except Exception as e:
+        return f"❌ Error generating answer: {str(e)}"
