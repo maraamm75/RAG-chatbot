@@ -12,3 +12,19 @@ mistral
 transformers
 tokenizer
 
+
+
+PyPDF2>=3.0.1
+sentence-transformers>=2.2.2
+transformers>=4.35.0
+torch>=2.0.0
+faiss-cpu>=1.7.4
+numpy>=1.24.0
+scikit-learn>=1.3.0
+accelerate>=0.24.0
+streamlit==1.28.1
+sentence-transformers>=2.2.2
+faiss-cpu>=1.7.2
+PyMuPDF>=1.23.0
+requests>=2.25.0
+pandas>=1.3.0
